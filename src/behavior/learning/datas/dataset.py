@@ -67,6 +67,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self,
         repo_id: str,
         root: str | Path | None = None,
+        metadata_root: str | Path | None = None,
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[list[float]] | None = None,
@@ -122,6 +123,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         Dataset.__init__(self)
         self.repo_id = repo_id
         self.root = Path(os.path.expanduser(str(root))) if root else HF_LEROBOT_HOME / repo_id
+        self.metadata_root = Path(os.path.expanduser(str(metadata_root))) if metadata_root else self.root
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
         self.tolerance_s = tolerance_s
@@ -159,6 +161,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.meta = BehaviorLerobotDatasetMetadata(
             repo_id=self.repo_id,
             root=self.root,
+            metadata_root=self.metadata_root,
             revision=self.revision,
             force_cache_sync=force_cache_sync,
             tasks=self.task_names,
@@ -166,7 +169,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             cameras=cameras,
         )
         # overwrite episode based on task
-        all_episodes = load_jsonlines(self.root / EPISODES_PATH)
+        all_episodes = [self.meta.episodes[ep_idx] for ep_idx in sorted(self.meta.episodes)]
         # get the episodes grouped by task
         epi_by_task = defaultdict(list)
         for item in all_episodes:
@@ -201,9 +204,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         logger.info(f"Total episodes: {len(self.episodes)}")
         # ====================================
 
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
+        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1") and self.meta.episodes_stats:
+            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes if ep_idx in self.meta.episodes_stats]
+            if episodes_stats:
+                self.stats = aggregate_stats(episodes_stats)
 
         # Load actual data
         try:
@@ -610,6 +614,7 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         self,
         repo_id: str,
         root: str | Path | None = None,
+        metadata_root: str | Path | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         # === Customized arguments for BehaviorLeRobotDataset ===
@@ -632,6 +637,8 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         self.repo_id = repo_id
         self.revision = revision or CODEBASE_VERSION
         self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        self.metadata_root = Path(metadata_root) if metadata_root is not None else self.root
+        self.local_episode_task_dirs = self.discover_local_episode_task_dirs(self.root)
 
         try:
             if force_cache_sync:
@@ -641,14 +648,20 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
-            (self.root / "meta").mkdir(exist_ok=True, parents=True)
+            (self.metadata_root / "meta").mkdir(exist_ok=True, parents=True)
             self.pull_from_repo(allow_patterns="meta/**", ignore_patterns="meta/episodes/**")
             self.load_metadata()
 
     def load_metadata(self):
-        self.info = load_info(self.root)
+        info_dir = self.root if (self.root / "meta/info.json").exists() else self.metadata_root
+        tasks_dir = self.root if (self.root / TASKS_PATH).exists() else self.metadata_root
+        stats_dir = self.root if (self.root / EPISODES_STATS_PATH).exists() else self.metadata_root
+        annotations_dir = self.root if (self.root / ANNOTATIONS_PATH).exists() else self.metadata_root
+        orchestrators_dir = self.root if (self.root / ORCHESTRATORS_PATH).exists() else annotations_dir
+
+        self.info = load_info(info_dir)
         check_version_compatibility(self.repo_id, self._version, CODEBASE_VERSION)
-        self.tasks, self.task_to_task_index, self.task_names = self.load_tasks(self.root)
+        self.tasks, self.task_to_task_index, self.task_names = self.load_tasks(tasks_dir)
         # filter based on self.task_name_candidates
         valid_task_indices = [idx for idx, name in self.task_names.items() if name in self.task_name_candidates]
         self.task_names = set([self.task_names[idx] for idx in valid_task_indices])
@@ -656,15 +669,30 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         self.task_to_task_index = {v: k for k, v in self.tasks.items()}
 
         self.episodes = self.load_episodes(self.root)
-        self.annotations = self.load_annotations(self.root)
-        self.orchestrators = self.load_orchestrators(self.root)
+        self.annotations = self.load_annotations(annotations_dir)
+        self.orchestrators = self.load_orchestrators(orchestrators_dir)
         if self._version < packaging.version.parse("v2.1"):
-            self.stats = self.load_stats(self.root)
-            self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes)
+            self.stats = self.load_stats(stats_dir)
+            self.episodes_stats = backward_compatible_episodes_stats(self.stats, self.episodes) if self.stats else {}
         else:
-            self.episodes_stats = self.load_episodes_stats(self.root)
-            self.stats = aggregate_stats(list(self.episodes_stats.values()))
+            self.episodes_stats = self.load_episodes_stats(stats_dir)
+            self.stats = aggregate_stats(list(self.episodes_stats.values())) if self.episodes_stats else None
         logger.info(f"Loaded metadata for {len(self.episodes)} episodes.")
+
+    def discover_local_episode_task_dirs(self, local_dir: Path) -> dict[int, str]:
+        candidates_by_episode = defaultdict(set)
+        for pattern in ("meta/episodes/task-*/episode_*.json", "data/task-*/episode_*.parquet"):
+            for path in local_dir.glob(pattern):
+                candidates_by_episode[int(path.stem[8:])].add(path.parent.name)
+
+        episode_task_dirs = {}
+        for episode_index, candidate_dirs in candidates_by_episode.items():
+            expected_dir = f"task-{episode_index // 10_000:04d}"
+            if expected_dir in candidate_dirs:
+                episode_task_dirs[episode_index] = expected_dir
+            else:
+                episode_task_dirs[episode_index] = sorted(candidate_dirs)[-1]
+        return episode_task_dirs
 
     def load_tasks(self, local_dir: Path) -> tuple[dict, dict]:
         tasks = load_jsonlines(local_dir / TASKS_PATH)
@@ -674,12 +702,67 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         return tasks, task_to_task_index, task_names
 
     def load_episodes(self, local_dir: Path) -> dict:
-        episodes = load_jsonlines(local_dir / EPISODES_PATH)
-        return {
-            item["episode_index"]: item
-            for item in sorted(episodes, key=lambda x: x["episode_index"])
-            if item["episode_index"] // 1e4 in self.tasks
+        local_episode_ids = self.discover_local_episode_ids(local_dir)
+        episodes_path = local_dir / EPISODES_PATH
+        if episodes_path.exists():
+            episodes = load_jsonlines(episodes_path)
+            return {
+                item["episode_index"]: item
+                for item in sorted(episodes, key=lambda x: x["episode_index"])
+                if item["episode_index"] // 1e4 in self.tasks
+                and (local_episode_ids is None or item["episode_index"] in local_episode_ids)
+            }
+        return self.build_episodes_from_local_subset(local_dir, local_episode_ids)
+
+    def discover_local_episode_ids(self, local_dir: Path) -> set[int] | None:
+        data_root = local_dir / "data"
+        if not data_root.exists():
+            return None
+
+        episode_ids = set()
+        for parquet_path in data_root.glob("task-*/episode_*.parquet"):
+            episode_ids.add(int(parquet_path.stem[8:]))
+        return episode_ids
+
+    def build_episodes_from_local_subset(self, local_dir: Path, episode_ids: set[int] | None = None) -> dict:
+        import pyarrow.parquet as pq
+
+        episode_meta_root = local_dir / "meta" / "episodes"
+        if not episode_meta_root.exists():
+            raise FileNotFoundError(f"Missing {EPISODES_PATH} and local episode metadata under {episode_meta_root}")
+
+        metadata_episode_ids = {
+            int(episode_path.stem[8:]) for episode_path in episode_meta_root.glob("task-*/episode_*.json")
         }
+        if episode_ids is None:
+            episode_ids = metadata_episode_ids
+        else:
+            episode_ids = episode_ids.intersection(metadata_episode_ids)
+
+        episodes = {}
+        for episode_index in sorted(episode_ids):
+            task_index = episode_index // 10_000
+            if task_index not in self.tasks:
+                continue
+
+            task_dir = self.local_episode_task_dirs.get(episode_index, f"task-{task_index:04d}")
+            episode_path = episode_meta_root / task_dir / f"episode_{episode_index:08d}.json"
+            data_path = local_dir / "data" / task_dir / f"episode_{episode_index:08d}.parquet"
+            if not data_path.exists():
+                continue
+
+            length = pq.ParquetFile(data_path).metadata.num_rows
+            if length is None:
+                logger.warning(f"Skipping episode {episode_index}: length not found in {data_path}")
+                continue
+
+            episodes[episode_index] = {
+                "episode_index": episode_index,
+                "tasks": [self.tasks[task_index]],
+                "length": int(length),
+            }
+
+        return episodes
 
     def load_stats(self, local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
         if not (local_dir / STATS_PATH).exists():
@@ -697,6 +780,8 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
 
     def load_annotations(self, local_dir: Path) -> dict:
         annotations = local_dir / ANNOTATIONS_PATH
+        if not annotations.exists():
+            return {}
         task_list = [task_id for task_id in annotations.iterdir() if task_id.is_dir()]
         return {
             int(episode.stem[8:]): load_json(episode)
@@ -727,14 +812,32 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         return orchestrators
 
     def get_annotation_path(self, ep_index: int) -> Path:
+        task_dir = self.local_episode_task_dirs.get(ep_index)
+        if task_dir is not None:
+            return Path(ANNOTATIONS_PATH) / task_dir / f"episode_{ep_index:08d}.json"
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.annotation_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
         return Path(fpath)
 
     def get_metainfo_path(self, ep_index: int) -> Path:
+        task_dir = self.local_episode_task_dirs.get(ep_index)
+        if task_dir is not None:
+            return Path("meta/episodes") / task_dir / f"episode_{ep_index:08d}.json"
         ep_chunk = self.get_episode_chunk(ep_index)
         fpath = self.metainfo_path.format(episode_chunk=ep_chunk, episode_index=ep_index)
         return Path(fpath)
+
+    def get_data_file_path(self, ep_index: int) -> Path:
+        task_dir = self.local_episode_task_dirs.get(ep_index)
+        if task_dir is not None:
+            return Path("data") / task_dir / f"episode_{ep_index:08d}.parquet"
+        return super().get_data_file_path(ep_index)
+
+    def get_video_file_path(self, ep_index: int, vid_key: str) -> Path:
+        task_dir = self.local_episode_task_dirs.get(ep_index)
+        if task_dir is not None:
+            return Path("videos") / task_dir / vid_key / f"episode_{ep_index:08d}.mp4"
+        return super().get_video_file_path(ep_index, vid_key)
 
     @property
     def annotation_path(self) -> str | None:

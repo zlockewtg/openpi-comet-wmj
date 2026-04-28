@@ -102,6 +102,9 @@ class DataConfig:
 
     # Only used for B1K data loader.
     behavior_dataset_root: str = None
+    # Optional metadata root for skill-split B1K subsets. When set, shared files such as meta/info.json
+    # can be loaded from this directory while episode/data files still come from behavior_dataset_root.
+    behavior_dataset_metadata_root: str | None = None
 
     # Action space for DROID dataset.
     action_space: DroidActionSpace | None = None
@@ -121,6 +124,14 @@ class DataConfig:
     # tolerance decoding
     tolerance_s: float = 1e-4
 
+    # Whether to run LeRobot's timestamp synchronization validation when opening the dataset.
+    # Skill-split local subsets may violate the original global timestamp assumptions.
+    check_timestamp_sync: bool = True
+
+    # B1K: skip this many initial tabular (parquet) rows per episode so indices align with video
+    # when videos have fewer decodable frames than parquet rows (e.g. fixed 26-frame offset).
+    align_tabular_skip_initial_frames: int = 0
+
     # fine-grained level of orchestrators to use for training
     fine_grained_level: int = (0,)  # 0, 1, 2
 
@@ -132,6 +143,41 @@ class DataConfig:
 
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+
+    # Use skill_prompts.json format: "Skill: X. Objects: A, B. Goal: Z" instead of "move to radio"
+    use_skill_prompt_format: bool = False
+
+    # When scene has multiple objects of the target type, use "move to the closest obj" instead of "move to X"
+    use_closest_obj_when_multiple: bool = False
+
+    # When False, ignore annotation memory_prefix (e.g. "back", "the other") when building prompts.
+    use_memory_prefix: bool = True
+
+    # When True (default), load per-segment language from data_root/orchestrators/ if that folder exists.
+    # For 2025-challenge-demos those files often use the generic skill label "move to" only. Set False to
+    # always build prompts from skill_annotation (move to + target object, or use_skill_prompt_format template).
+    use_prebuilt_orchestrators: bool = True
+
+    # When set, only these action dims contribute to loss (e.g. [0,1,2] for base-only in move-to).
+    # R1Pro: base=0:3, torso=3:7, left_arm=7:14, left_gripper=14:15, right_arm=15:22, right_gripper=22:23.
+    action_loss_indices: list[int] | None = None
+
+    # Per-dimension loss weights (non-negative). If set, overrides ``action_loss_indices``.
+    # Length 23 matches B1K action layout; shorter vectors are zero-padded to the model ``action_dim``.
+    # Example for move-to (emphasize base): tuple([3.0] * 3 + [0.3] * 20) for base vs rest.
+    action_loss_weights: tuple[float, ...] | None = None
+
+    # B1K only: on the last frame of each orchestrator segment (skill_annotation end_frame), override the
+    # first action step to "full pause": base velocity dims 0:3 -> 0, joint position dims 3:23 -> current
+    # proprio (same layout as B1kInputs). No effect when False or outside BehaviorLeRobotDataset.
+    pause_action_at_skill_segment_end: bool = False
+
+    # B1K only: after the orchestrator segment ``end_frame`` (same time axis as ``frame_index``), set base
+    # velocity (action dims 0:3) to 0 for every action-chunk step whose logical time is strictly past ``end_frame``.
+    # Episode tail uses min(frame+k, last_episode_frame) so clamped rows after the episode end still get base 0
+    # when that logical time is past the segment end. Enable via
+    # ``DataConfig.zero_base_velocity_after_skill_segment_end``.
+    zero_base_velocity_after_skill_segment_end: bool = False
 
     # CFGRL optimality conditioning. Set to 1 for optimal demos, 0 for rollback / suboptimal demos.
     # When not None, this label is appended to the prompt and randomly dropped with cfgrl_condition_dropout.
@@ -659,7 +705,7 @@ _CONFIGS = [
         batch_size=8 * 32,
     ),
     TrainConfig(
-        name="pi05_b1k-turning_on_radio_cs32_bs32_lr2.5e-5_step30k",
+        name="pi05_b1k-turning_on_radio_cs32_bs32_lr2.5e-6_step30k",
         exp_name="openpi",
         project_name="B1K",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
@@ -676,7 +722,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            peak_lr=2.5e-5,
+            peak_lr=2.5e-6,
             decay_steps=30_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
@@ -791,12 +837,12 @@ _CONFIGS = [
         batch_size=8 * 32,
     ),
     TrainConfig(
-        name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_2:8_single_base",
-        exp_name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_2:8_single_base",
+        name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_5:5_single_base",
+        exp_name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_5:5_single_base",
         project_name="B1K",
         save_interval=300,
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
-        sample_weights=[0.2, 0.8],
+        sample_weights=[0.5, 0.5],
         # PyTorch 训练用 train_pytorch.py；权重从该目录加载 model.safetensors（非 JAX params）
         pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
         data=[
@@ -808,7 +854,9 @@ _CONFIGS = [
                 ),
                 base_config=DataConfig(
                     prompt_from_task=True,
-                    behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                    behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/data_move_to",
+                    behavior_dataset_metadata_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                    check_timestamp_sync=False,
                     tasks=[
                         "turning_on_radio",
                         "hanging_pictures",
@@ -849,7 +897,133 @@ _CONFIGS = [
         ema_decay=None,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=".",
-        num_workers=8,
+        num_workers=16,
+        batch_size=8 * 32,
+    ),
+     TrainConfig(
+        name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_2:8_single_base",
+        exp_name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_2:8_single_base",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        sample_weights=[0.2, 0.8],
+        # PyTorch 训练用 train_pytorch.py；权重从该目录加载 model.safetensors（非 JAX params）
+        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32/assets",
+                    asset_id="behavior-1k/2025-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/data_move_to",
+                    behavior_dataset_metadata_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                    check_timestamp_sync=False,
+                    tasks=[
+                        "turning_on_radio",
+                        "hanging_pictures",
+                        "attach_a_camera_to_a_tripod",
+                        "clean_a_trumpet",
+                        "cook_cabbage",
+                        "chop_an_onion",
+                        "cook_hot_dogs",
+                        "cook_bacon",
+                    ],
+                    fine_grained_level=2,
+                    skill_list=["move to:1.0"],
+                ),
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32/assets",
+                    asset_id="behavior-1k/2025-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/project_rlinf/tgy/data/rft_move_to/move_to_rollouts33_scan_rollouts33",
+                    tasks=None,
+                    fine_grained_level=2,
+                    skill_list=["move to:1.0"],
+                ),
+            ),
+        ],
+        # PyTorch 入口不读 JAX CheckpointWeightLoader；预训练权重由 pytorch_weight_path 提供
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2e-5,
+            decay_steps=50_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=".",
+        num_workers=16,
+        batch_size=8 * 32,
+    ),              
+     TrainConfig(
+        name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_5:5_single_base_compute_norm",
+        exp_name="pi05-pt50-pretrain-20k_rft_moveto_mix_skills_step_5:5_single_base_compute_norm",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        sample_weights=[0.5, 0.5],
+        # PyTorch 训练用 train_pytorch.py；权重从该目录加载 model.safetensors（非 JAX params）
+        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_comute_norm",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/data_move_to",
+                    behavior_dataset_metadata_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                    check_timestamp_sync=False,
+                    tasks=[
+                        "turning_on_radio",
+                        "hanging_pictures",
+                        "attach_a_camera_to_a_tripod",
+                        "clean_a_trumpet",
+                        "cook_cabbage",
+                        "chop_an_onion",
+                        "cook_hot_dogs",
+                        "cook_bacon",
+                    ],
+                    fine_grained_level=2,
+                    skill_list=["move to:1.0"],
+                ),
+            ),
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_comute_norm",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/project_rlinf/tgy/data/rft_move_to/move_to_rollouts33_scan_rollouts33",
+                    tasks=None,
+                    fine_grained_level=2,
+                    skill_list=["move to:1.0"],
+                ),
+            ),
+        ],
+        # PyTorch 入口不读 JAX CheckpointWeightLoader；预训练权重由 pytorch_weight_path 提供
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2e-5,
+            decay_steps=50_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=".",
+        num_workers=16,
         batch_size=8 * 32,
     ),
     # 2.1 CFGRL Configs
@@ -1155,6 +1329,39 @@ _CONFIGS = [
         num_workers=8,
         batch_size=4 * 32,
     ),
+        TrainConfig(
+        name="pi05_b1k_pick_up_from_skill",
+        exp_name="pi05_b1k-pick_up_from_skill",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_pick_up_from_skill",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                tasks=None,
+                fine_grained_level=2,
+                skill_list=["pick up from:1.0"],
+            ),
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        assets_base_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_pick_up_from_skill",
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
     # now is the config for skill training
     TrainConfig(
         name="pi05_b1k-pickupfrom-lr2.5e-step20k",
@@ -1228,6 +1435,51 @@ _CONFIGS = [
         keep_period=5000,
         num_workers=8,
         batch_size=4 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k-move_to_single_object_accelerate",
+        exp_name="openpi-move-to-sft-acc",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                tasks=[
+                        "turning_on_radio",
+                        "hanging_pictures",
+                        "attach_a_camera_to_a_tripod",
+                        "clean_a_trumpet",
+                        "cook_cabbage",
+                        "chop_an_onion",
+                        "cook_hot_dogs",
+                        "cook_bacon",
+                    ],
+                fine_grained_level=2,
+                skill_list=["move to:1.0"],
+                use_prebuilt_orchestrators=False,
+                use_skill_prompt_format=False,
+                use_closest_obj_when_multiple=False,
+                align_tabular_skip_initial_frames=0,
+            ),
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2e-5,
+            decay_steps=50_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
     ),
     # now is the config for skill training: placeinplaceon
     TrainConfig(
@@ -1406,7 +1658,9 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/data_move_to",
+                behavior_dataset_metadata_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                check_timestamp_sync=False,
                 fine_grained_level=2,  # 0: global instruction, 1: skill name, 2: subtask description
                 skill_list=["move to:1.0"],
                 tasks=[
@@ -1439,6 +1693,7 @@ _CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
+    
     # PyTorch-only: move skill SFT from safetensors (scripts/train_pytorch.py). JAX weight_loader unused.
     # accum=2: same nominal batch as JAX (8*32); each forward uses half the samples to fit PyTorch VRAM peaks.
     TrainConfig(
@@ -1454,7 +1709,9 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/data_move_to",
+                behavior_dataset_metadata_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                check_timestamp_sync=False,
                 fine_grained_level=2,  # 0: global instruction, 1: skill name, 2: subtask description
                 skill_list=["move to:1.0"],
                 tasks=[
@@ -1467,13 +1724,20 @@ _CONFIGS = [
                     "cook_hot_dogs",
                     "cook_bacon",
                 ],
+                action_loss_weights=(
+                    3.0, 3.0, 3.0,              # base 0:3
+                    2.0, 2.0, 2.0, 2.0,         # torso 3:7
+                    *([1.0] * 7),               # left_arm 7:14
+                    1.0,                         # left_gripper 14:15
+                    *([1.0] * 7),               # right_arm 15:22
+                    1.0,                         # right_gripper 22:23
+                ),
             ),
         ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
         pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
         num_train_steps=50_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            peak_lr=2.5e-5,
+            peak_lr=2e-5,
             decay_steps=50_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
@@ -1483,9 +1747,74 @@ _CONFIGS = [
         log_interval=100,
         save_interval=1000,
         keep_period=5000,
+        num_workers=16,
+        batch_size=8 * 32,
+        pytorch_gradient_accumulation_steps=1,
+    ),
+    # PyTorch SFT: single task "Set up a coffee station..." (B1K task_name set_up_a_coffee_station_in_your_kitchen).
+    # Mirrors pi05_b1k-turning_on_radio_cs32_bs32_lr2.5e-6_step30k but loads pi05-b1kpt50 via safetensors for train_pytorch.py.
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_comute_norm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-6,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32/assets",
+        checkpoint_base_dir=".",
         num_workers=8,
         batch_size=8 * 32,
-        # 8×80GB: accum=2 → 16 samples/GPU/forward (~2× activations vs accum=4); nominal batch still 256.
+        pytorch_gradient_accumulation_steps=1,
+    ),
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_comute_norm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+            ),
+        ),
+        pytorch_weight_path="/mnt/project_rlinf/tgy/openpi-comet/pi05-b1kpt12-cs32", # "/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-6,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
         pytorch_gradient_accumulation_steps=1,
     ),
     # 4. Multi-dataset Training Configs
@@ -1527,6 +1856,53 @@ _CONFIGS = [
         checkpoint_base_dir=".",
         num_workers=8,
         batch_size=8 * 32,
+    ),
+        TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm_rft_mix_pt12",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm_rft_mix_pt12",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        sample_weights=[0.8, 0.2],
+        data=[LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm_rft_mix",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+            ),
+        ),
+            LeRobotB1KDataConfig(
+                repo_id="delinqu/comet-1.5k",
+                assets=AssetsConfig(
+                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm_rft_mix",
+                asset_id="behavior-1k/2025-challenge-demos",
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/delinqu/comet-1.5k/",
+                     tasks=["make_microwave_popcorn"],
+                    fine_grained_level=0,  # 0, 1, 2
+                ),
+            ),
+        ],
+        pytorch_weight_path="/mnt/project_rlinf/tgy/openpi-comet/pi05-b1kpt12-cs32",
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+        pytorch_gradient_accumulation_steps=1,
     ),
 ]
 

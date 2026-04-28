@@ -162,9 +162,6 @@ def create_behavior_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    # The lightweight norm path no longer decodes video, so worker startup/pickling
-    # is typically more expensive than iterating in-process.
-    behavior_num_workers = 0
     lightweight_configs = [
         dataclasses.replace(data_config, modalities=[], return_seg_instance=False) for data_config in data_configs
     ]
@@ -198,7 +195,7 @@ def create_behavior_dataloader(
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
-        num_workers=behavior_num_workers,
+        num_workers=num_workers,
         shuffle=shuffle,
         num_batches=num_batches,
         framework="pytorch",
@@ -206,21 +203,32 @@ def create_behavior_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+):
     config = _config.get_config(config_name)
     data_factories = _get_data_factories(config)
     data_configs = [data_factory.create(config.assets_dirs, config.model) for data_factory in data_factories]
     data_config = data_configs[0]
+    batch_size = batch_size or config.batch_size
+    num_workers = config.num_workers if num_workers is None else num_workers
 
     if len(data_configs) > 1:
         if not all(data_config.behavior_dataset_root for data_config in data_configs):
             raise ValueError("Multi-dataset norm stats are only supported for behavior datasets.")
 
+        print(
+            f"Computing behavior norm stats with batch_size={batch_size}, num_workers={num_workers}, "
+            f"datasets={len(data_configs)}"
+        )
         data_loader, num_batches = create_behavior_dataloader(
             config,
             data_configs,
-            config.batch_size,
-            config.num_workers,
+            batch_size,
+            num_workers,
             max_frames,
         )
 
@@ -265,15 +273,15 @@ def main(config_name: str, max_frames: int | None = None):
     else:
         if data_config.rlds_data_dir is not None:
             data_loader, num_batches = create_rlds_dataloader(
-                data_config, config.model.action_horizon, config.batch_size, max_frames
+                data_config, config.model.action_horizon, batch_size, max_frames
             )
         else:
             data_loader, num_batches = create_torch_dataloader(
                 data_config,
                 config.model.action_horizon,
-                config.batch_size,
+                batch_size,
                 config.model,
-                config.num_workers,
+                num_workers,
                 max_frames,
             )
 

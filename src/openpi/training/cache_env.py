@@ -6,7 +6,8 @@ import logging
 import os
 from pathlib import Path
 
-# Large shared disk; keeps HF / tmp / openpi / wandb / torch caches off overlay.
+# Large shared disk; keeps HF / uv / tmp / openpi / wandb / torch caches under
+# ``TGY_DISK_ROOT/.cache`` (not the container overlay).
 TGY_DISK_ROOT = Path("/mnt/project_rlinf/tgy")
 
 
@@ -17,20 +18,32 @@ def apply_tgy_disk_caches(*, log: bool = True) -> dict[str, str]:
     related tooling do not fill the container overlay (``/``).
     """
     root = TGY_DISK_ROOT
+    cache_home = root / ".cache"
+    hf = cache_home / "huggingface"
     layout: list[tuple[str, Path]] = [
-        ("HF_HOME", root / ".cache" / "huggingface"),
-        ("HF_DATASETS_CACHE", root / ".cache" / "huggingface" / "datasets"),
-        ("HF_HUB_CACHE", root / ".cache" / "huggingface" / "hub"),
-        ("OPENPI_DATA_HOME", root / ".cache" / "openpi"),
-        ("TMPDIR", root / "tmp"),
-        ("WANDB_DIR", root / ".wandb"),
-        ("TORCH_HOME", root / ".cache" / "torch"),
+        # Broad defaults (uv falls back to $XDG_CACHE_HOME/uv when UV_CACHE_DIR is unset).
+        ("XDG_CACHE_HOME", cache_home),
+        ("HF_HOME", hf),
+        ("HF_DATASETS_CACHE", hf / "datasets"),
+        ("HF_HUB_CACHE", hf / "hub"),
+        ("HF_ASSETS_CACHE", hf / "assets"),
+        ("HF_MODULES_CACHE", hf / "modules"),
+        ("HF_LEROBOT_HOME", hf / "lerobot"),
+        ("OPENPI_DATA_HOME", cache_home / "openpi"),
+        ("TMPDIR", cache_home / "tmp"),
+        ("WANDB_DIR", cache_home / "wandb"),
+        ("TORCH_HOME", cache_home / "torch"),
+        # uv wheel/sdist extraction (archive-v0) lives under UV_CACHE_DIR; set it before
+        # ``uv sync`` / ``uv run`` so the venv is not tied to /opt/venv/.cache.
+        ("UV_CACHE_DIR", cache_home / "uv"),
     ]
     resolved: dict[str, str] = {}
     for key, path in layout:
         path.mkdir(parents=True, exist_ok=True)
         os.environ[key] = str(path)
         resolved[key] = str(path)
+
+    (cache_home / "jax").mkdir(parents=True, exist_ok=True)
 
     if log:
         log_lines = [f"Disk cache layout (root={root}):"]

@@ -137,10 +137,12 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
+        metadata_root=data_config.behavior_dataset_metadata_root,
         tolerance_s=data_config.tolerance_s,
         tasks=data_config.tasks,
         modalities=data_config.modalities,
         local_only=True,
+        check_timestamp_sync=data_config.check_timestamp_sync,
         delta_timestamps={key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys},
         episodes=data_config.episodes_index,
         chunk_streaming_using_keyframe=True,

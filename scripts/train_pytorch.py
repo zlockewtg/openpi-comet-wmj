@@ -28,6 +28,11 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
 # Must be set before CUDA allocator init (before ``import torch``).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import openpi.training.cache_env as _cache_env
+
+# Before ``import torch`` / HF so child processes and libs see project-disk caches.
+_cache_env.apply_tgy_disk_caches(log=False)
+
 import dataclasses
 import gc
 import logging
@@ -47,7 +52,6 @@ import wandb
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
-import openpi.training.cache_env as _cache_env
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 
@@ -141,6 +145,34 @@ def build_datasets(config: _config.TrainConfig, *, loader_global_batch_size: int
         seed=config.seed,
     )
     return data_loader, data_loader.data_config()
+
+
+def _resolve_action_loss_weights_tensor(
+    data_config: _config.DataConfig, action_dim: int
+) -> torch.Tensor | None:
+    """Per-dimension weights for reducing MSE over action dims (see ``DataConfig.action_loss_weights``)."""
+    if data_config.action_loss_weights is not None:
+        w = list(data_config.action_loss_weights)
+    elif data_config.action_loss_indices is not None:
+        w = [0.0] * action_dim
+        for i in data_config.action_loss_indices:
+            if 0 <= i < action_dim:
+                w[i] = 1.0
+    else:
+        return None
+    if len(w) < action_dim:
+        w = [*w, *([0.0] * (action_dim - len(w)))]
+    else:
+        w = w[:action_dim]
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def _reduce_action_loss(losses: torch.Tensor, dim_weights: torch.Tensor | None) -> torch.Tensor:
+    """``losses`` shape (..., D); weighted mean over last dim when ``dim_weights`` is (D,)."""
+    if dim_weights is None:
+        return losses.mean()
+    denom = dim_weights.sum().clamp_min(1e-8)
+    return (losses * dim_weights).sum(dim=-1).mean() / denom
 
 
 def get_model_state_dict(model):
@@ -511,6 +543,15 @@ def train_loop(config: _config.TrainConfig):
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
+    loss_dim_weights = _resolve_action_loss_weights_tensor(data_config, model_cfg.action_dim)
+    if loss_dim_weights is not None:
+        loss_dim_weights = loss_dim_weights.to(device)
+        if is_main:
+            logging.info(
+                "Per-dimension action loss weights enabled "
+                f"(nonzero dims={(loss_dim_weights > 0).sum().item()}, sum={loss_dim_weights.sum().item():.4f})"
+            )
+
     model.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
@@ -568,7 +609,7 @@ def train_loop(config: _config.TrainConfig):
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss_mean = losses.mean()
+            loss_mean = _reduce_action_loss(losses, loss_dim_weights)
             (loss_mean / accum).backward()
             step_loss_sum += float(loss_mean.detach().item())
 

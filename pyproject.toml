@@ -60,6 +60,8 @@ rlds = [
 ]
 
 [tool.uv]
+# Install wheels as real files under the venv (not symlinks into /opt/venv/.cache).
+link-mode = "copy"
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
 [tool.uv.sources]

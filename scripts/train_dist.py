@@ -1,3 +1,7 @@
+import openpi.training.cache_env as _cache_env
+
+_cache_env.apply_tgy_disk_caches(log=False)
+
 import dataclasses
 import functools
 import logging
@@ -225,7 +229,7 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_compilation_cache_dir", str(_cache_env.TGY_DISK_ROOT / ".cache" / "jax"))
 
     base_rng = jax.random.fold_in(jax.random.key(config.seed), jax.process_index())
     train_rng, _ = jax.random.split(base_rng)
