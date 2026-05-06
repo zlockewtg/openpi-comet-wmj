@@ -182,7 +182,6 @@ torchinductor_root/
 error-archive/
 *.log
 BEHAVIOR-1K/
-openpi/
 pi05_b1k-pick_up_from_skill/
 pi05_b1k-press_skill/
 pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k/
