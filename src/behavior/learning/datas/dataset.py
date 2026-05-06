@@ -90,6 +90,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        state_history_window: int = 0,
     ):
         """
         Custom args:
@@ -135,6 +136,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.state_history_window = state_history_window
 
         # Unused attributes
         self.image_writer = None
@@ -389,12 +391,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        cache_dir = os.environ.get("HF_DATASETS_CACHE", "/mnt/public/tgy/cache/huggingface/datasets")
+        os.makedirs(cache_dir, exist_ok=True)
         if self.episodes is None:
             path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train", cache_dir=cache_dir)
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            hf_dataset = load_dataset("parquet", data_files=files, split="train", cache_dir=cache_dir)
 
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
@@ -402,6 +406,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
     def __getitem__(self, idx) -> dict:
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
+            self._add_state_history(item, idx, item["episode_index"].item())
             item["task"] = self._get_fine_grained_task(item)
             return item
 
@@ -496,6 +501,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             # 当帧被接受时，break 跳出循环，继续后续的视觉观测加载
             break
 
+        self._add_state_history(item, self.current_streaming_frame_idx, ep_idx)
+
         # load visual observations
         for key in self.meta.video_keys:
             item[key] = next(self.obs_loaders[key])[0]
@@ -529,6 +536,19 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.current_streaming_frame_idx += 1
 
         return item
+
+    def _add_state_history(self, item: dict, idx: int, ep_idx: int) -> None:
+        if self.state_history_window <= 0:
+            return
+        history_indices = self._get_state_history_indices(idx, ep_idx, self.state_history_window)
+        history = self._query_hf_dataset({"observation.state": history_indices})
+        item["observation.state_history"] = history["observation.state"]
+
+    def _get_state_history_indices(self, idx: int, ep_idx: int, window: int) -> list[int]:
+        idx = int(idx)
+        ep_pos = self.episode_data_index_pos[ep_idx]
+        ep_start = int(self.episode_data_index["from"][ep_pos].item())
+        return [max(ep_start, idx - delta) for delta in range(window, 0, -1)]
 
     def _get_current_task_skill(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
@@ -936,8 +956,8 @@ def build_orchestrators_from_annotations(annotations: dict, episodes: dict) -> d
     """Fallback for datasets that ship skill_annotation but no orchestrators/ directory.
 
     Level 1 keeps the raw skill name for filtering (e.g. ``move to``).
-    Level 2 uses a lightweight prompt; for move-to data we expand it to
-    ``move to <object>`` so fine_grained_level=2 remains useful.
+    Level 2 uses a lightweight prompt; for object-targeted skills we expand it
+    with the annotated object ids so fine_grained_level=2 remains useful.
     """
     orchestrators = {}
     for ep_idx, episode_data in sorted(episodes.items()):
@@ -972,6 +992,12 @@ def build_orchestrators_from_annotations(annotations: dict, episodes: dict) -> d
             object_groups = skill_ann.get("object_id") or []
             if skill_desc == "move to" and object_groups and object_groups[0]:
                 prompt = f"move to {_annotation_object_to_text(object_groups[0][0])}"
+            elif skill_desc == "press" and object_groups and object_groups[0]:
+                prompt = f"press {_annotation_object_to_text(object_groups[0][0])}"
+            elif skill_desc == "place on" and object_groups and len(object_groups[0]) >= 2:
+                object_text = _annotation_object_to_text(object_groups[0][0])
+                target_text = _annotation_object_to_text(object_groups[0][1])
+                prompt = f"place {object_text} on {target_text}"
 
             level1_segment = {
                 "task": skill_desc,

@@ -48,12 +48,16 @@ class ExtractBehaviorStateActions(transforms.DataTransformFn):
 
     action_dim: int
     action_key: str
+    use_state_history_prefix: bool = False
 
     def __call__(self, x: dict) -> dict:
-        return {
+        item = {
             "state": transforms.pad_to_dim(extract_state_from_proprio(np.asarray(x["observation.state"])), self.action_dim),
             "actions": transforms.pad_to_dim(np.asarray(x[self.action_key]), self.action_dim),
         }
+        if self.use_state_history_prefix:
+            item["state_history"] = extract_state_from_proprio(np.asarray(x["observation.state_history"]))
+        return item
 
 
 def _get_data_factories(config: _config.TrainConfig) -> list[_config.DataConfigFactory]:
@@ -180,6 +184,7 @@ def create_behavior_dataloader(
             ExtractBehaviorStateActions(
                 action_dim=config.model.action_dim,
                 action_key=lightweight_configs[0].action_sequence_keys[0],
+                use_state_history_prefix=lightweight_configs[0].use_state_history_prefix,
             ),
             RemoveStrings(),
         ],
@@ -233,6 +238,8 @@ def main(
         )
 
         keys = ["state", "actions"]
+        if data_configs[0].use_state_history_prefix:
+            keys.append("state_history")
         stats = {key: normalize.RunningStats() for key in keys}
 
         for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
@@ -241,35 +248,56 @@ def main(
 
         norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
     elif data_config.behavior_dataset_root:
-        from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
+        if data_config.use_state_history_prefix:
+            print(
+                f"Computing behavior norm stats from samples with batch_size={batch_size}, "
+                f"num_workers={num_workers}, state_history_window={data_config.state_history_window}"
+            )
+            data_loader, num_batches = create_behavior_dataloader(
+                config,
+                data_configs,
+                batch_size,
+                num_workers,
+                max_frames,
+            )
+            keys = ["state", "state_history", "actions"]
+            stats = {key: normalize.RunningStats() for key in keys}
 
-        metadata = BehaviorLerobotDatasetMetadata(
-            repo_id=data_config.repo_id,
-            root=data_config.behavior_dataset_root,
-            tasks=data_config.tasks,
-            modalities=[],
-            cameras=[],
-        )
-        stats = metadata.stats
-        if data_config.episodes_index is not None:
-            from omnigibson.learning.datas import BehaviorLeRobotDataset
+            for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+                for key in keys:
+                    stats[key].update(np.asarray(batch[key]))
 
-            dataset = BehaviorLeRobotDataset(
+            norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+        else:
+            from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
+
+            metadata = BehaviorLerobotDatasetMetadata(
                 repo_id=data_config.repo_id,
                 root=data_config.behavior_dataset_root,
                 tasks=data_config.tasks,
                 modalities=[],
                 cameras=[],
-                episodes=data_config.episodes_index,
             )
-            stats = dataset.stats
+            stats = metadata.stats
+            if data_config.episodes_index is not None:
+                from omnigibson.learning.datas import BehaviorLeRobotDataset
 
-        norm_stats = {"state": {}, "actions": {}}
-        for key in ["mean", "std", "q01", "q99"]:
-            norm_stats["state"][key] = transforms.pad_to_dim(
-                extract_state_from_proprio(stats["observation.state"][key]), config.model.action_dim
-            )
-            norm_stats["actions"][key] = transforms.pad_to_dim(stats["action"][key], config.model.action_dim)
+                dataset = BehaviorLeRobotDataset(
+                    repo_id=data_config.repo_id,
+                    root=data_config.behavior_dataset_root,
+                    tasks=data_config.tasks,
+                    modalities=[],
+                    cameras=[],
+                    episodes=data_config.episodes_index,
+                )
+                stats = dataset.stats
+
+            norm_stats = {"state": {}, "actions": {}}
+            for key in ["mean", "std", "q01", "q99"]:
+                norm_stats["state"][key] = transforms.pad_to_dim(
+                    extract_state_from_proprio(stats["observation.state"][key]), config.model.action_dim
+                )
+                norm_stats["actions"][key] = transforms.pad_to_dim(stats["action"][key], config.model.action_dim)
     else:
         if data_config.rlds_data_dir is not None:
             data_loader, num_batches = create_rlds_dataloader(

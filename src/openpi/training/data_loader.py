@@ -150,6 +150,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
+        state_history_window=data_config.state_history_window if data_config.use_state_history_prefix else 0,
         **args,
     )
 

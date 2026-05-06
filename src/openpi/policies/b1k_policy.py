@@ -27,6 +27,7 @@ def make_b1k_example() -> dict:
         "observation/wrist_image_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/joint_position": np.random.rand(23),
+        "observation/privileged_state": np.random.rand(226).astype(np.float32),
         "prompt": "do something",
     }
 
@@ -107,6 +108,10 @@ class B1kInputs(transforms.DataTransformFn):
 
     pcd_downsample: int = 6
 
+    use_privileged_teacher_obs: bool = False
+
+    use_state_history_prefix: bool = False
+
     def __call__(self, data: dict) -> dict:
         proprio_data = data["observation/state"]
         # extract joint position
@@ -154,6 +159,16 @@ class B1kInputs(transforms.DataTransformFn):
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
 
+        if self.use_state_history_prefix:
+            if "observation/state_history" not in data:
+                raise KeyError(
+                    "B1kInputs(use_state_history_prefix=True) requires "
+                    "'observation/state_history' after repack."
+                )
+            inputs["state_history"] = extract_state_from_proprio(
+                np.asarray(data["observation/state_history"])
+            ).astype(np.float32)
+
         if "actions" in data:
             inputs["actions"] = action
 
@@ -162,6 +177,14 @@ class B1kInputs(transforms.DataTransformFn):
 
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
+
+        if self.use_privileged_teacher_obs:
+            if "observation/privileged_state" not in data:
+                raise KeyError(
+                    "B1kInputs(use_privileged_teacher_obs=True) requires "
+                    "'observation/privileged_state' after repack."
+                )
+            inputs["privileged_state"] = np.asarray(data["observation/privileged_state"], dtype=np.float32)
         return inputs
 
 

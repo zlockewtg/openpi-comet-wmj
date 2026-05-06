@@ -9,6 +9,8 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.privileged_tokens import PrivilegedTeacherTokenProjector
+from openpi.models_pytorch.state_history_tokens import StateHistoryTokenProjector
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -100,6 +102,30 @@ class PI0Pytorch(nn.Module):
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
 
+        self.privileged_token_proj = None
+        if getattr(config, "use_privileged_teacher_obs", False):
+            if getattr(config, "privileged_teacher_injection", "prefix_tokens") != "prefix_tokens":
+                raise ValueError(
+                    "PyTorch PI0 privileged teacher SFT currently supports only "
+                    "privileged_teacher_injection='prefix_tokens'."
+                )
+            self.privileged_token_proj = PrivilegedTeacherTokenProjector(
+                embed_dim=paligemma_config.width,
+                hidden_dim=getattr(config, "privileged_teacher_token_hidden_dim", 256),
+                num_tokens=getattr(config, "privileged_teacher_num_tokens", 5),
+                obs_dim=getattr(config, "privileged_teacher_obs_dim", 226),
+            )
+
+        self.state_history_token_proj = None
+        if getattr(config, "use_state_history_prefix", False):
+            self.state_history_token_proj = StateHistoryTokenProjector(
+                embed_dim=paligemma_config.width,
+                hidden_dim=getattr(config, "state_history_token_hidden_dim", 256),
+                window=getattr(config, "state_history_window", 32),
+                state_dim=getattr(config, "state_history_dim", 23),
+                num_tokens=getattr(config, "state_history_num_tokens", 32),
+            )
+
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -168,6 +194,44 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            observation.state_history,
+            observation.privileged_state,
+        )
+
+    def _append_privileged_prefix_tokens(self, prefix_embs, prefix_pad_masks, prefix_att_masks, privileged_state):
+        if self.privileged_token_proj is None:
+            return prefix_embs, prefix_pad_masks, prefix_att_masks
+        if privileged_state is None:
+            raise ValueError("use_privileged_teacher_obs=True requires observation.privileged_state in the batch.")
+
+        privileged_state = privileged_state.to(device=prefix_embs.device, dtype=torch.float32)
+        privileged_embs = self.privileged_token_proj(privileged_state).to(dtype=prefix_embs.dtype)
+        bsize, num_tokens = privileged_embs.shape[:2]
+        privileged_pad_masks = torch.ones(bsize, num_tokens, dtype=torch.bool, device=prefix_pad_masks.device)
+        privileged_att_masks = torch.zeros(bsize, num_tokens, dtype=prefix_att_masks.dtype, device=prefix_att_masks.device)
+
+        return (
+            torch.cat([prefix_embs, privileged_embs], dim=1),
+            torch.cat([prefix_pad_masks, privileged_pad_masks], dim=1),
+            torch.cat([prefix_att_masks, privileged_att_masks], dim=1),
+        )
+
+    def _append_state_history_prefix_tokens(self, prefix_embs, prefix_pad_masks, prefix_att_masks, state_history):
+        if self.state_history_token_proj is None:
+            return prefix_embs, prefix_pad_masks, prefix_att_masks
+        if state_history is None:
+            raise ValueError("use_state_history_prefix=True requires observation.state_history in the batch.")
+
+        state_history = state_history.to(device=prefix_embs.device, dtype=torch.float32)
+        history_embs = self.state_history_token_proj(state_history).to(dtype=prefix_embs.dtype)
+        bsize, num_tokens = history_embs.shape[:2]
+        history_pad_masks = torch.ones(bsize, num_tokens, dtype=torch.bool, device=prefix_pad_masks.device)
+        history_att_masks = torch.zeros(bsize, num_tokens, dtype=prefix_att_masks.dtype, device=prefix_att_masks.device)
+
+        return (
+            torch.cat([prefix_embs, history_embs], dim=1),
+            torch.cat([prefix_pad_masks, history_pad_masks], dim=1),
+            torch.cat([prefix_att_masks, history_att_masks], dim=1),
         )
 
     def sample_noise(self, shape, device):
@@ -316,7 +380,9 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, state_history, privileged_state = self._preprocess_observation(
+            observation, train=True
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -329,6 +395,12 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self._append_privileged_prefix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, privileged_state
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self._append_state_history_prefix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, state_history
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -381,9 +453,17 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, state_history, privileged_state = self._preprocess_observation(
+            observation, train=False
+        )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self._append_privileged_prefix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, privileged_state
+        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self._append_state_history_prefix_tokens(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, state_history
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

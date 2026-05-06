@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 # Large shared disk; keeps HF / uv / tmp / openpi / wandb / torch caches under
-# ``TGY_DISK_ROOT/.cache`` (not the container overlay).
-TGY_DISK_ROOT = Path("/mnt/project_rlinf/tgy")
+# ``/mnt/public/tgy/cache`` (not the container overlay).
+TGY_DISK_ROOT = Path(os.environ.get("TGY_DISK_ROOT", "/mnt/public/tgy"))
 
 
 def apply_tgy_disk_caches(*, log: bool = True) -> dict[str, str]:
@@ -18,7 +18,7 @@ def apply_tgy_disk_caches(*, log: bool = True) -> dict[str, str]:
     related tooling do not fill the container overlay (``/``).
     """
     root = TGY_DISK_ROOT
-    cache_home = root / ".cache"
+    cache_home = Path(os.environ.get("SHARED_CACHE_ROOT", str(root / "cache")))
     hf = cache_home / "huggingface"
     layout: list[tuple[str, Path]] = [
         # Broad defaults (uv falls back to $XDG_CACHE_HOME/uv when UV_CACHE_DIR is unset).
@@ -33,6 +33,9 @@ def apply_tgy_disk_caches(*, log: bool = True) -> dict[str, str]:
         ("TMPDIR", cache_home / "tmp"),
         ("WANDB_DIR", cache_home / "wandb"),
         ("TORCH_HOME", cache_home / "torch"),
+        ("TRITON_CACHE_DIR", cache_home / "triton"),
+        ("PIP_CACHE_DIR", cache_home / "pip"),
+        ("TRANSFORMERS_CACHE", hf / "transformers"),
         # uv wheel/sdist extraction (archive-v0) lives under UV_CACHE_DIR; set it before
         # ``uv sync`` / ``uv run`` so the venv is not tied to /opt/venv/.cache.
         ("UV_CACHE_DIR", cache_home / "uv"),

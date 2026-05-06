@@ -184,6 +184,13 @@ class DataConfig:
     cfgrl_optimality_label: int | None = None
     cfgrl_condition_dropout: float = 0.0
 
+    # B1K/OpenPI teacher SFT: pass a 226D VIRAL-style privileged observation through the data pipeline.
+    use_privileged_teacher_obs: bool = False
+
+    # B1K/OpenPI SFT: pass a fixed window of previous extracted proprio state through the data pipeline.
+    use_state_history_prefix: bool = False
+    state_history_window: int = 32
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -338,26 +345,44 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        use_privileged_teacher_obs = bool(
+            getattr(model_config, "use_privileged_teacher_obs", False)
+            or ((self.base_config is not None) and self.base_config.use_privileged_teacher_obs)
+        )
+        use_state_history_prefix = bool(
+            getattr(model_config, "use_state_history_prefix", False)
+            or ((self.base_config is not None) and self.base_config.use_state_history_prefix)
+        )
+
         # Make inputs look like they come from the Libero environment
+        repack_structure = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if use_privileged_teacher_obs:
+            repack_structure["observation/privileged_state"] = "observation.privileged_state"
+        if use_state_history_prefix:
+            repack_structure["observation/state_history"] = "observation.state_history"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_structure)]
         )
 
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[
+                b1k_policy.B1kInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    use_privileged_teacher_obs=use_privileged_teacher_obs,
+                    use_state_history_prefix=use_state_history_prefix,
+                )
+            ],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
         )
 
@@ -387,6 +412,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
             use_quantile_norm=True,
+            use_privileged_teacher_obs=use_privileged_teacher_obs,
+            use_state_history_prefix=use_state_history_prefix,
+            state_history_window=getattr(model_config, "state_history_window", 32),
         )
 
 
@@ -1294,7 +1322,7 @@ _CONFIGS = [
     ),
     # now is the config for skill training
     TrainConfig(
-        name="pi05_b1k-pickupfrom-lr2.5e-step20k-200",
+        name="pi05_b1k-pickupfrom-lr2.5e5-step20k-200",
         exp_name="openpi",
         project_name="B1K",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
@@ -1316,7 +1344,7 @@ _CONFIGS = [
         ),
         num_train_steps=20_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            peak_lr=2.5e-6,
+            peak_lr=2.5e-5,
             decay_steps=20_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
@@ -1327,24 +1355,24 @@ _CONFIGS = [
         save_interval=1000,
         keep_period=5000,
         num_workers=8,
-        batch_size=4 * 32,
+        batch_size=8 * 96,
     ),
-        TrainConfig(
+    TrainConfig(
         name="pi05_b1k_pick_up_from_skill",
         exp_name="pi05_b1k-pick_up_from_skill",
         project_name="B1K",
         save_interval=300,
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
-        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             assets=AssetsConfig(
-                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_pick_up_from_skill",
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
                 asset_id="behavior-1k/2025-challenge-demos",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
-                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos",
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos",
                 tasks=None,
                 fine_grained_level=2,
                 skill_list=["pick up from:1.0"],
@@ -1354,13 +1382,79 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
             decay_steps=50_000,
+    ),
+    assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+    freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+    ema_decay=None,
+    checkpoint_base_dir=".",
+    num_workers=8,
+    batch_size=8 * 64,
+    ),
+    TrainConfig(
+        name="pi05_b1k_place_on_skill",
+        exp_name="pi05_b1k-place_on_skill",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos",
+                tasks=None,
+                fine_grained_level=2,
+                skill_list=["place on:1.0"],
+            ),
         ),
-        assets_base_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_pick_up_from_skill",
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-5,
+            decay_steps=50_000,
+        ),
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir=".",
         num_workers=8,
-        batch_size=8 * 32,
+        batch_size=8 * 64,
+    ),
+    TrainConfig(
+        name="pi05_b1k_press_skill",
+        exp_name="pi05_b1k-press_skill",
+        project_name="B1K",
+        save_interval=300,
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+                asset_id="behavior-1k/2025-challenge-demos",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos",
+                tasks=None,
+                fine_grained_level=2,
+                skill_list=["press:1.0"],
+            ),
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-5,
+            decay_steps=50_000,
+        ),
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=4 * 64,
     ),
     # now is the config for skill training
     TrainConfig(
@@ -1754,24 +1848,24 @@ _CONFIGS = [
     # PyTorch SFT: single task "Set up a coffee station..." (B1K task_name set_up_a_coffee_station_in_your_kitchen).
     # Mirrors pi05_b1k-turning_on_radio_cs32_bs32_lr2.5e-6_step30k but loads pi05-b1kpt50 via safetensors for train_pytorch.py.
     TrainConfig(
-        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k",
-        exp_name="openpi",
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k",
         project_name="B1K",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             assets=AssetsConfig(
-                assets_dir="/mnt/project_rlinf/mjwei/repo/openpi-comet/outputs/assets/train/pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_comute_norm",
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(200)),
-                behavior_dataset_root="/mnt/project_rlinf_hs/mjwei/download_models/2025-challenge-demos/",
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos/",
                 tasks=["make_microwave_popcorn"],
                 fine_grained_level=0,
             ),
         ),
-        pytorch_weight_path="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32",
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
         weight_loader=weight_loaders.NoOpWeightLoader(),
         num_train_steps=30_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1780,11 +1874,179 @@ _CONFIGS = [
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
-        assets_base_dir="/mnt/project_rlinf_hs/mjwei/download_models/openpi_comet/sunshk/openpi_comet_pytorch/pi05-b1kpt50-cs32/assets",
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
         checkpoint_base_dir=".",
+        save_interval=500,
+        num_workers=8,
+        batch_size=4 * 128,
+    ),
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            use_state_history_prefix=True,
+            state_history_window=32,
+            state_history_dim=23,
+            state_history_num_tokens=32,
+            state_history_token_hidden_dim=256,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+                use_state_history_prefix=True,
+                state_history_window=32,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="/mnt/public/tgy/openpi-comet-wmj/outputs/assets/train",
+        checkpoint_base_dir=".",
+        save_interval=500,
         num_workers=8,
         batch_size=8 * 32,
-        pytorch_gradient_accumulation_steps=1,
+    ),
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix_ckpt_norm",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix_ckpt_norm",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            use_state_history_prefix=True,
+            state_history_window=32,
+            state_history_dim=23,
+            state_history_num_tokens=32,
+            state_history_token_hidden_dim=256,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+                use_state_history_prefix=True,
+                state_history_window=32,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+        checkpoint_base_dir=".",
+        save_interval=500,
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix_ckpt_norm_256_his",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_statehist32_prefix_ckpt_norm_256_his",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            use_state_history_prefix=True,
+            state_history_window=256,
+            state_history_dim=23,
+            state_history_num_tokens=256,
+            state_history_token_hidden_dim=256,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+                use_state_history_prefix=True,
+                state_history_window=256,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+        checkpoint_base_dir=".",
+        save_interval=500,
+        num_workers=8,
+        batch_size=8 * 64,
+    ),
+    TrainConfig(
+        name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_privileged",
+        exp_name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr5e-6_step30k_privileged",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            use_privileged_teacher_obs=True,
+            privileged_teacher_injection="prefix_tokens",
+            privileged_teacher_obs_dim=226,
+            privileged_teacher_num_tokens=5,
+            privileged_teacher_token_hidden_dim=256,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="/mnt/public/tgy/datasets/2025-challenge-demos/",
+                tasks=["make_microwave_popcorn"],
+                fine_grained_level=0,
+                use_privileged_teacher_obs=True,
+            ),
+        ),
+        pytorch_weight_path="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32",
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=5e-6,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="/mnt/public/tgy/ckpts/pi05-b1kpt50-cs32/assets",
+        checkpoint_base_dir=".",
+        save_interval=500,
+        num_workers=8,
+        batch_size=4 * 128,
     ),
     TrainConfig(
         name="pi05_b1k_make_microwave_popcorn_pytorch_cs32_lr2.5e-6_step30k_compute_norm",

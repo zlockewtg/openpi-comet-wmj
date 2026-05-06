@@ -37,6 +37,20 @@ class Pi0Config(_model.BaseModelConfig):
     # whether to use pointnet to encode the point cloud
     pcd: bool = False
 
+    # VIRAL-style privileged teacher observation injection. The default keeps baseline SFT unchanged.
+    use_privileged_teacher_obs: bool = False
+    privileged_teacher_injection: str = "prefix_tokens"
+    privileged_teacher_obs_dim: int = 226
+    privileged_teacher_num_tokens: int = 5
+    privileged_teacher_token_hidden_dim: int = 256
+
+    # Optional proprio/state history injection for PyTorch PI05 SFT.
+    use_state_history_prefix: bool = False
+    state_history_window: int = 32
+    state_history_dim: int = 23
+    state_history_num_tokens: int = 32
+    state_history_token_hidden_dim: int = 256
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -74,6 +88,19 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                state_history=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.state_history_window, self.state_history_dim],
+                        jnp.float32,
+                    )
+                    if self.use_state_history_prefix
+                    else None
+                ),
+                privileged_state=(
+                    jax.ShapeDtypeStruct([batch_size, self.privileged_teacher_obs_dim], jnp.float32)
+                    if self.use_privileged_teacher_obs
+                    else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 pcd_xyz=jax.ShapeDtypeStruct([batch_size, 16, 2025, 3], jnp.float32),

@@ -507,9 +507,27 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        load_strict = not (
+            getattr(model_cfg, "use_privileged_teacher_obs", False)
+            or getattr(model_cfg, "use_state_history_prefix", False)
         )
+        missing_keys, unexpected_keys = safetensors.torch.load_model(
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            model_path,
+            strict=load_strict,
+            device=str(device),
+        )
+        if missing_keys or unexpected_keys:
+            logging.info(
+                "Loaded PyTorch weights with strict=%s (missing=%d, unexpected=%d)",
+                load_strict,
+                len(missing_keys),
+                len(unexpected_keys),
+            )
+            if missing_keys:
+                logging.info("Missing keys: %s", sorted(missing_keys)[:20])
+            if unexpected_keys:
+                logging.info("Unexpected keys: %s", sorted(unexpected_keys)[:20])
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
